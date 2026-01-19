@@ -1,5 +1,6 @@
 import cv2
 import sys
+import time
 import logging
 import argparse
 
@@ -149,17 +150,17 @@ def main():
     output_dir = Path(args.output_dir)
     if not output_dir.exists():
         output_dir.mkdir(parents=True, exist_ok=True)
-        log.info("Output directory isn't existed and created at {}".format(output_dir))
+        log.info("Output directory isn't existed and created at %s", output_dir)
 
     img = cv2.imread(input_image)
-    log.info("Loaded image from {}".format(input_image))
+    log.info("Loaded image from %s", input_image)
 
     input_blob, ratio_w, ratio_h = preprocess_input(img, args.canvas_size, args.mag_ratio)
 
     _, _, target_h, target_w = input_blob.shape 
 
     ov_detector_model = core.read_model(model_path)
-    log.info("Read EasyOCR detection model from {}".format(model_path))
+    log.info("Read EasyOCR detection model from %s", model_path)
 
     prep = ov.preprocess.PrePostProcessor(ov_detector_model)
     prep.input(0).tensor().set_layout(ov.Layout("NCHW"))
@@ -170,12 +171,15 @@ def main():
 
     if device == "NPU":
         ov_detector_model.reshape([1, 3, target_h, target_w])
-        log.info ("Reshape model input to static input shape({}, {}, {}, {}) for NPU inference.".format(1, 3, target_h, target_w))
+        log.info ("Reshape model input to static input shape(%d, %d, %d, %d) for NPU inference.", 1, 3, target_h, target_w)
 
     ov_detector = core.compile_model(ov_detector_model, device)
-    log.info("Compiled EasyOCR detection model on {}".format(device))
+    log.info("Compiled EasyOCR detection model on %s", device)
 
+    start_t = time.time()
     detect_result = ov_detector(input_blob)
+    infer_t = time.time() - start_t
+    log.info("Inference time: %.3f s", infer_t)
 
     horizontal_list_agg, _ = postprocess_detections(detect_result, ratio_w, ratio_h, 
                                                     args.text_threshold, args.link_threshold, args.low_text, 
@@ -183,7 +187,7 @@ def main():
                                                     args.width_ths, args.add_margin, args.min_size)
 
     cv2.imwrite(output_dir / "detection_result.jpg", draw_box(img.copy(), horizontal_list_agg[0]))
-    log.info("Detection results saved to {}".format(output_dir / "detection_result.jpg"))
+    log.info("Detection results saved to %s", output_dir / "detection_result.jpg")
 
     return 0
 
