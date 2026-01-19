@@ -149,12 +149,15 @@ def main():
     output_dir = Path(args.output_dir)
     if not output_dir.exists():
         output_dir.mkdir(parents=True, exist_ok=True)
+        log.info("Output directory isn't existed and created at {}".format(output_dir))
 
     img = cv2.imread(input_image)
+    log.info("Loaded image from {}".format(input_image))
 
     input_blob, ratio_w, ratio_h = preprocess_input(img, args.canvas_size, args.mag_ratio)
 
     ov_detector_model = core.read_model(model_path)
+    log.info("Read EasyOCR detection model from {}".format(model_path))
 
     prep = ov.preprocess.PrePostProcessor(ov_detector_model)
     prep.input(0).tensor().set_layout(ov.Layout("NCHW"))
@@ -164,6 +167,7 @@ def main():
     ov_detector_model = prep.build()
 
     ov_detector = core.compile_model(ov_detector_model, device)
+    log.info("Compiled EasyOCR detection model on {}".format(device))
 
     detect_result = ov_detector(input_blob)
 
@@ -172,7 +176,8 @@ def main():
                                                     args.slope_ths, args.ycenter_ths, args.height_ths, 
                                                     args.width_ths, args.add_margin, args.min_size)
 
-    cv2.imwrite(output_dir / "dd_box.jpg", draw_box(img.copy(), horizontal_list_agg[0]))
+    cv2.imwrite(output_dir / "detection_result.jpg", draw_box(img.copy(), horizontal_list_agg[0]))
+    log.info("Detection results saved to {}".format(output_dir / "detection_result.jpg"))
 
     return 0
 
