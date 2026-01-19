@@ -15,7 +15,7 @@ Please use below command to convert model, and then you can find the models unde
 * Get Detection model and Recognition model for English:
 
     ```py
-    python ov_convert.py --models_dir ov_models -- language en
+    python ov_convert.py --models_dir ov_models --language en
     ```
 
 ## Run inference
