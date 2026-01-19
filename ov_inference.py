@@ -156,6 +156,8 @@ def main():
 
     input_blob, ratio_w, ratio_h = preprocess_input(img, args.canvas_size, args.mag_ratio)
 
+    _, _, target_h, target_w = input_blob.shape 
+
     ov_detector_model = core.read_model(model_path)
     log.info("Read EasyOCR detection model from {}".format(model_path))
 
@@ -165,6 +167,10 @@ def main():
     prep.input(0).preprocess().mean([0.485, 0.456, 0.406]).scale([0.229, 0.224, 0.225])
 
     ov_detector_model = prep.build()
+
+    if device == "NPU":
+        ov_detector_model.reshape([1, 3, target_h, target_w])
+        log.info ("Reshape model input to static input shape({}, {}, {}, {}) for NPU inference.".format(1, 3, target_h, target_w))
 
     ov_detector = core.compile_model(ov_detector_model, device)
     log.info("Compiled EasyOCR detection model on {}".format(device))
