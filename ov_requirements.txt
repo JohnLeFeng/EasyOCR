@@ -1,0 +1,3 @@
+easyocr
+openvino
+opencv-python

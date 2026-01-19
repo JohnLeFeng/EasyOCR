@@ -1,3 +1,33 @@
+# EasyOCR Text Detection with OpenVINO backend
+
+OpenVINO-based inference implementation for EasyOCR Text Detection.
+
+## Construct envirenment
+
+```bash
+pip install -r ov_requirements.txt
+```
+
+## Convert model to IR
+
+Please use below command to convert model, and then you can find the models under directory, `ov_models` in default.
+
+* Get Detection model and Recognition model for English:
+
+    ```py
+    python ov_convert.py --models_dir ov_models --language en
+    ```
+
+## Run inference
+
+Please use below command to run inference to get detection result.
+
+```sh
+python ov_inference.py -i <image>.png -d GPU -m ov_models/detector.xml
+```
+
+-----
+
 # EasyOCR
 
 [![PyPI Status](https://badge.fury.io/py/easyocr.svg)](https://badge.fury.io/py/easyocr)
