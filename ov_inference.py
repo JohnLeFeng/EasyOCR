@@ -75,6 +75,7 @@ def postprocess_detections(detect_result, ratio_w, ratio_h, text_threshold, link
     estimate_num_chars = None
     optimal_num_chars = None
 
+    # Ref https://github.com/JaidedAI/EasyOCR/blob/363afb184047ce452e436f4224f3098422df872e/easyocr/detection.py#L48-L72
     y, feature = detect_result[0], detect_result[1]
 
     boxes_list, polys_list = [], []
@@ -103,6 +104,7 @@ def postprocess_detections(detect_result, ratio_w, ratio_h, text_threshold, link
 
     text_box_list = []
 
+    # Ref: https://github.com/JaidedAI/EasyOCR/blob/363afb184047ce452e436f4224f3098422df872e/easyocr/detection.py#L103-L108
     for polys in polys_list:
         single_img_result = []
         for i, box in enumerate(polys):
@@ -110,6 +112,7 @@ def postprocess_detections(detect_result, ratio_w, ratio_h, text_threshold, link
             single_img_result.append(poly)
         text_box_list.append(single_img_result)
 
+    # Ref: https://github.com/JaidedAI/EasyOCR/blob/363afb184047ce452e436f4224f3098422df872e/easyocr/easyocr.py#L337-L349
     horizontal_list_agg, free_list_agg = [], []
     for text_box in text_box_list:
         horizontal_list, free_list = group_text_box(text_box, slope_ths,
@@ -131,10 +134,11 @@ def draw_box(img, boxes):
     maximum_y, maximum_x, _ = img.shape
 
     for _obj in boxes:
-        x_min = max(0,_obj[0])
-        x_max = min(_obj[1],maximum_x)
-        y_min = max(0,_obj[2])
-        y_max = min(_obj[3],maximum_y)
+        # Ref: https://github.com/JaidedAI/EasyOCR/blob/363afb184047ce452e436f4224f3098422df872e/easyocr/utils.py#L601-L604
+        x_min = max(0, _obj[0])
+        x_max = min(_obj[1], maximum_x)
+        y_min = max(0, _obj[2])
+        y_max = min(_obj[3], maximum_y)
         cv2.rectangle(img, (x_min, y_min), (x_max, y_max), (255, 0, 0), 2)
     
     return img
