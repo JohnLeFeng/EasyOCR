@@ -26,8 +26,10 @@ def parse_args():
     args = parser.add_argument_group('Options')
     args.add_argument('-h', '--help', action='help',
                       help='Show this help message and exit.')
-    args.add_argument('-d', '--device', type=str, default="GPU",
-                      help='Optional. Device for OpenVINO inference. Default is "GPU".')
+    args.add_argument('--det_device', type=str, default="NPU",
+                      help='Optional. Device for detection model inference. Default is "NPU".')
+    args.add_argument('--rec_device', type=str, default="NPU",
+                      help='Optional. Device for recognition model inference. Default is "NPU".')
     args.add_argument('-i', '--input_image', type=str, required=True,
                       help='Path to the input image for OCR.')
     args.add_argument('-o', '--output_dir', type=str, default="output",
@@ -84,6 +86,11 @@ def parse_args():
     args.add_argument("--filter_ths", type=float, default=0.03,
                       help="Optional. Filter out results with confidence below this threshold. "
                            "Default is 0.03.")
+    args.add_argument("--dynamic_width", action="store_true",
+                      help="Optional. Use per-crop dynamic input width for recognition "
+                           "instead of the fixed --imgW for all crops. "
+                           "Only works on CPU/GPU (NPU always uses fixed width). "
+                           "--imgW becomes the upper-bound cap.")
 
     return parser.parse_args()
 
@@ -325,7 +332,8 @@ def main():
 
     detector_path = Path(args.detector_model)
     recognizer_path = Path(args.recognizer_model)
-    device = args.device
+    det_device = args.det_device
+    rec_device = args.rec_device
     input_image = Path(args.input_image)
     output_dir = Path(args.output_dir)
     if not output_dir.exists():
@@ -358,32 +366,39 @@ def main():
     prep.input(0).preprocess().mean([0.485, 0.456, 0.406]).scale([0.229, 0.224, 0.225])
     ov_detector_model = prep.build()
 
-    if device == "NPU":
+    if det_device == "NPU":
         ov_detector_model.reshape([1, 3, target_h, target_w])
         log.info("Reshaped detector input to [1, 3, %d, %d] for NPU.", target_h, target_w)
-        ov_detector = core.compile_model(ov_detector_model, device, {"NPU_TILES": 1})
+        ov_detector = core.compile_model(ov_detector_model, det_device, {"NPU_TILES": 1})
     else:
-        ov_detector = core.compile_model(ov_detector_model, device)
-    log.info("Compiled detector model on %s", device)
+        ov_detector = core.compile_model(ov_detector_model, det_device)
+    log.info("Compiled detector model on %s", det_device)
 
     imgW = args.imgW
     batch_max_length = int(imgW / args.char_width)
-    log.info("Recognition input width: %d, batch_max_length: %d (char_width=%d)",
-             imgW, batch_max_length, args.char_width)
+
+    use_dynamic_width = args.dynamic_width and rec_device != "NPU"
+    if args.dynamic_width and rec_device == "NPU":
+        log.warning("--dynamic_width is not supported on NPU; using fixed width %d.", imgW)
+    if use_dynamic_width:
+        log.info("Dynamic width enabled (cap=%d, char_width=%d)", imgW, args.char_width)
+    else:
+        log.info("Recognition input width: %d, batch_max_length: %d (char_width=%d)",
+                 imgW, batch_max_length, args.char_width)
 
     # ── Load & compile recognizer model ─────────────────────────────────
     ov_recog_model = core.read_model(recognizer_path)
     log.info("Read recognizer model from %s", recognizer_path)
 
-    if device == "NPU":
+    if rec_device == "NPU":
         ov_recog_model.reshape({0: [1, 1, args.imgH, imgW],
                                 1: [1, batch_max_length + 1]})
         log.info("Reshaped recognizer input for NPU: image [1, 1, %d, %d], text [1, %d]",
                  args.imgH, imgW, batch_max_length + 1)
-        ov_recognizer = core.compile_model(ov_recog_model, device, {"NPU_TILES": 1})
+        ov_recognizer = core.compile_model(ov_recog_model, rec_device, {"NPU_TILES": 1})
     else:
-        ov_recognizer = core.compile_model(ov_recog_model, device)
-    log.info("Compiled recognizer model on %s", device)
+        ov_recognizer = core.compile_model(ov_recog_model, rec_device)
+    log.info("Compiled recognizer model on %s", rec_device)
 
     # ── Run detection ─────────────────────────────────────────────────────
     start_t = time.time()
@@ -418,8 +433,18 @@ def main():
     total_recog_time = 0.0
 
     for box, crop_img in image_list:
-        img_blob = preprocess_recognition(crop_img, imgH=args.imgH, imgW=imgW)
-        text_for_pred = np.zeros((1, batch_max_length + 1), dtype=np.int64)
+        # Compute per-crop width if dynamic mode is enabled
+        if use_dynamic_width:
+            h, w = crop_img.shape[:2]
+            crop_imgW = min(math.ceil(args.imgH * w / float(h)), imgW)
+            crop_imgW = max(crop_imgW, args.imgH)  # at least square
+            crop_bml = int(crop_imgW / args.char_width)
+        else:
+            crop_imgW = imgW
+            crop_bml = batch_max_length
+
+        img_blob = preprocess_recognition(crop_img, imgH=args.imgH, imgW=crop_imgW)
+        text_for_pred = np.zeros((1, crop_bml + 1), dtype=np.int64)
 
         start_t = time.time()
         recog_output = ov_recognizer({0: img_blob, 1: text_for_pred})
@@ -441,10 +466,18 @@ def main():
                  len(low_confident_idx), args.contrast_ths)
         for idx in low_confident_idx:
             box, crop_img = image_list[idx]
-            img_blob = preprocess_recognition(crop_img, imgH=args.imgH, imgW=imgW,
+            if use_dynamic_width:
+                h, w = crop_img.shape[:2]
+                crop_imgW = min(math.ceil(args.imgH * w / float(h)), imgW)
+                crop_imgW = max(crop_imgW, args.imgH)
+                crop_bml = int(crop_imgW / args.char_width)
+            else:
+                crop_imgW = imgW
+                crop_bml = batch_max_length
+            img_blob = preprocess_recognition(crop_img, imgH=args.imgH, imgW=crop_imgW,
                                               do_adjust_contrast=True,
                                               adjust_contrast_target=args.adjust_contrast)
-            text_for_pred = np.zeros((1, batch_max_length + 1), dtype=np.int64)
+            text_for_pred = np.zeros((1, crop_bml + 1), dtype=np.int64)
 
             start_t = time.time()
             recog_output = ov_recognizer({0: img_blob, 1: text_for_pred})
