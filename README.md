@@ -1,38 +1,7 @@
-# EasyOCR Text Detection with OpenVINO backend
-
-OpenVINO-based inference implementation for EasyOCR Text Detection.
-
-## Construct envirenment
-
-```bash
-pip install -r ov_requirements.txt
-```
-
-## Convert model to IR
-
-Please use below command to convert model, and then you can find the models under directory, `ov_models` in default.
-
-* Get Detection model and Recognition model for English:
-
-    ```py
-    python ov_convert.py --models_dir ov_models --language en
-    ```
-
-## Run inference
-
-Please use below command to run inference to get detection result.
-
-```sh
-python ov_inference.py -i <image>.png -d GPU -m ov_models/detector.xml
-```
-
------
-
 # EasyOCR
 
 [![PyPI Status](https://badge.fury.io/py/easyocr.svg)](https://badge.fury.io/py/easyocr)
 [![license](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/JaidedAI/EasyOCR/blob/master/LICENSE)
-[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.to/easyocr)
 [![Tweet](https://img.shields.io/twitter/url/https/github.com/JaidedAI/EasyOCR.svg?style=social)](https://twitter.com/intent/tweet?text=Check%20out%20this%20awesome%20library:%20EasyOCR%20https://github.com/JaidedAI/EasyOCR)
 [![Twitter](https://img.shields.io/badge/twitter-@JaidedAI-blue.svg?style=flat)](https://twitter.com/JaidedAI)
 
@@ -153,6 +122,104 @@ reader = easyocr.Reader(['en'], detection='DB', recognition = 'Transformer')
 The idea is to be able to plug in any state-of-the-art model into EasyOCR. There are a lot of geniuses trying to make better detection/recognition models, but we are not trying to be geniuses here. We just want to make their works quickly accessible to the public ... for free. (well, we believe most geniuses want their work to create a positive impact as fast/big as possible) The pipeline should be something like the below diagram. Grey slots are placeholders for changeable light blue modules.
 
 ![plan](examples/easyocr_framework.jpeg)
+
+## OpenVINO Inference
+
+This fork adds a **PyTorch-free** OpenVINO inference pipeline that runs the full
+detection + recognition flow on Intel CPU, GPU, or NPU.
+
+### Model Conversion
+
+Convert the EasyOCR PyTorch models to OpenVINO IR format:
+
+```bash
+pip install -r ov_requirements.txt
+python ov_convert.py
+```
+
+This produces `ov_model/detector.xml` and `ov_model/recognizer_en.xml`.
+
+### Detection Only
+
+To run **text detection only** (no recognition), use the standalone detection script:
+
+```bash
+python ov_inference_detection.py -i photo.png -d CPU
+```
+
+This outputs an annotated image with detected text bounding boxes. Run
+`python ov_inference_detection.py --help` for all options.
+
+### Running Inference (Detection + Recognition)
+
+```bash
+python ov_inference_recognition.py -i photo.png --det_device CPU --rec_device CPU
+```
+
+#### Device Options
+
+Detection and recognition run on **separate devices**, allowing mixed deployment
+(e.g. detection on NPU, recognition on CPU with dynamic shapes):
+
+| Flag | Default | Description |
+|---|---|---|
+| `--det_device` | `NPU` | Device for the CRAFT text detector |
+| `--rec_device` | `NPU` | Device for the english_g2 recognizer |
+
+Supported devices: `CPU`, `GPU`, `NPU`.
+
+#### Detection Parameters
+
+| Flag | Default | Description |
+|---|---|---|
+| `--canvas_size` | `2560` | Max image size for detection |
+| `--mag_ratio` | `1.0` | Image magnification ratio |
+| `--text_threshold` | `0.7` | Text confidence threshold |
+| `--low_text` | `0.4` | Text low-bound score |
+| `--link_threshold` | `0.4` | Link confidence threshold |
+| `--slope_ths` | `0.1` | Max slope for box merging |
+| `--ycenter_ths` | `0.5` | Max y-center shift for merging |
+| `--height_ths` | `0.5` | Max height difference for merging |
+| `--width_ths` | `0.5` | Max horizontal distance for merging |
+| `--add_margin` | `0.1` | Bounding box margin extension |
+| `--min_size` | `20` | Min box size in pixels |
+
+#### Recognition Parameters
+
+| Flag | Default | Description |
+|---|---|---|
+| `--imgH` | `64` | Recognition input height |
+| `--imgW` | `320` | Recognition input max width |
+| `--char_width` | `10` | Pixel width per character (`batch_max_length = imgW / char_width`) |
+| `--dynamic_width` | off | Per-crop dynamic input width (CPU/GPU only; `--imgW` becomes cap) |
+| `--decoder` | `greedy` | Decode strategy: `greedy`, `beamsearch`, `wordbeamsearch` |
+| `--beamWidth` | `5` | Beam width for search decoders |
+| `--contrast_ths` | `0.1` | Confidence threshold for contrast retry |
+| `--adjust_contrast` | `0.5` | Target contrast for retry pass |
+| `--filter_ths` | `0.03` | Discard results below this confidence |
+
+#### Output
+
+| Flag | Default | Description |
+|---|---|---|
+| `-o` | `output` | Output directory |
+
+The script saves an annotated image with bounding boxes and a text file with
+recognized text and confidence scores.
+
+#### Examples
+
+```bash
+# NPU for both (default)
+python ov_inference_recognition.py -i photo.png
+
+# CPU detection + GPU recognition with dynamic width
+python ov_inference_recognition.py -i photo.png --det_device CPU --rec_device GPU --dynamic_width
+
+# Beam search decoder with stricter filtering
+python ov_inference_recognition.py -i photo.png --det_device CPU --rec_device CPU \
+    --decoder beamsearch --beamWidth 10 --filter_ths 0.1
+```
 
 ## Acknowledgement and References
 
