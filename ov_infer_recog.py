@@ -4,6 +4,7 @@ import time
 import math
 import logging
 import argparse
+import itertools
 
 import numpy as np
 import openvino as ov
@@ -91,6 +92,23 @@ def parse_args():
                            "instead of the fixed --imgW for all crops. "
                            "Only works on CPU/GPU (NPU always uses fixed width). "
                            "--imgW becomes the upper-bound cap.")
+    args.add_argument("--slice_trigger_ratio", type=float, default=1.25,
+                      help="Optional. Split a detected text crop into overlapping slices when "
+                           "its width exceeds imgW * this ratio. Default is 1.25.")
+    args.add_argument("--slice_overlap_ratio", type=float, default=0.2,
+                      help="Optional. Horizontal overlap ratio between adjacent recognition "
+                           "slices for long crops. Default is 0.2.")
+    args.add_argument("--merge_before_decode", action="store_true",
+                      help="Optional. Merge raw model probability outputs from slices "
+                           "before CTC decoding, instead of decoding each slice "
+                           "independently and merging text. May improve accuracy "
+                           "for sliced long crops.")
+    args.add_argument("--merge_method", type=str, default="blank",
+                      choices=["blank", "avg"],
+                      help='Optional. Method for stitching probability matrices: '
+                           '"blank" = splice at highest blank-token boundary (preserves CTC alignment), '
+                           '"avg" = average overlapping timesteps. Default is "blank". '
+                           'Only used when --merge_before_decode is enabled.')
 
     return parser.parse_args()
 
@@ -203,6 +221,260 @@ def preprocess_recognition(crop_img, imgH=64, imgW=320, do_adjust_contrast=False
     return pad_img[np.newaxis, np.newaxis, :, :]
 
 
+def split_long_crop(crop_img, max_width, trigger_ratio=1.25, overlap_ratio=0.2):
+    """Split very wide recognition crops into overlapping horizontal slices."""
+    crop_width = crop_img.shape[1]
+    if crop_width <= max_width * trigger_ratio:
+        return [{"start_x": 0, "end_x": crop_width, "image": crop_img}]
+
+    overlap_pixels = int(round(max_width * overlap_ratio))
+    overlap_pixels = max(0, min(overlap_pixels, max_width - 1))
+    step = max(1, max_width - overlap_pixels)
+
+    slices = []
+    start_x = 0
+    while start_x < crop_width:
+        end_x = min(start_x + max_width, crop_width)
+        start_x = max(0, end_x - max_width)
+        if slices and start_x <= slices[-1][0]:
+            break
+        slices.append((start_x, crop_img[:, start_x:end_x]))
+        if end_x >= crop_width:
+            break
+        start_x += step
+
+    return [{"start_x": start_x, "end_x": start_x + item.shape[1], "image": item}
+            for start_x, item in slices]
+
+
+def estimate_overlap_char_count(text_length, overlap_pixels, slice_width):
+    if text_length <= 0 or overlap_pixels <= 0 or slice_width <= 0:
+        return 0
+
+    estimated = int(round(text_length * overlap_pixels / float(slice_width)))
+    return max(1, min(text_length, estimated))
+
+
+def normalize_char_confidences(text, char_confidences, fallback_confidence):
+    if not text:
+        return []
+
+    if len(char_confidences) == len(text):
+        return [float(value) for value in char_confidences]
+
+    if not char_confidences:
+        return [float(fallback_confidence)] * len(text)
+
+    return [float(value) for value in itertools.islice(itertools.cycle(char_confidences), len(text))]
+
+
+def merge_slice_texts(slice_predictions):
+    """Merge left-to-right slice predictions using overlap-region confidence."""
+    merged_text = ""
+    merged_char_confidences = []
+    previous_prediction = None
+
+    for prediction in slice_predictions:
+        text = prediction["text"]
+        if not text:
+            continue
+
+        char_confidences = normalize_char_confidences(
+            text, prediction.get("char_confidences", []), prediction.get("confidence", 0.0))
+        if not merged_text:
+            merged_text = text
+            merged_char_confidences = char_confidences
+            previous_prediction = prediction
+            continue
+
+        overlap_pixels = max(0, previous_prediction["end_x"] - prediction["start_x"])
+        previous_overlap_chars = estimate_overlap_char_count(
+            len(previous_prediction["text"]), overlap_pixels, previous_prediction["end_x"] - previous_prediction["start_x"])
+        current_overlap_chars = estimate_overlap_char_count(
+            len(text), overlap_pixels, prediction["end_x"] - prediction["start_x"])
+
+        if overlap_pixels <= 0 or previous_overlap_chars == 0 or current_overlap_chars == 0:
+            merged_text += text
+            merged_char_confidences.extend(char_confidences)
+            previous_prediction = prediction
+            continue
+
+        previous_suffix_text = merged_text[-previous_overlap_chars:]
+        previous_suffix_confidences = merged_char_confidences[-previous_overlap_chars:]
+        current_prefix_text = text[:current_overlap_chars]
+        current_prefix_confidences = char_confidences[:current_overlap_chars]
+
+        previous_overlap_confidence = sum(previous_suffix_confidences) / len(previous_suffix_confidences)
+        current_overlap_confidence = sum(current_prefix_confidences) / len(current_prefix_confidences)
+
+        if current_overlap_confidence > previous_overlap_confidence:
+            merged_text = (merged_text[:-previous_overlap_chars] + current_prefix_text +
+                           text[current_overlap_chars:])
+            merged_char_confidences = (merged_char_confidences[:-previous_overlap_chars] +
+                                       current_prefix_confidences +
+                                       char_confidences[current_overlap_chars:])
+        else:
+            merged_text += text[current_overlap_chars:]
+            merged_char_confidences.extend(char_confidences[current_overlap_chars:])
+
+        previous_prediction = prediction
+
+    return merged_text
+
+
+def stitch_slice_probs(slice_probs_list, slice_infos, imgW, method='blank'):
+    """Stitch softmax probability matrices from overlapping slices before decoding.
+
+    Methods:
+        'avg'   — Average the overlapping timesteps (original).
+        'blank' — Find the best blank-token cut point in each overlap zone and
+                   splice cleanly there, preserving CTC alignment on both sides.
+
+    Blank-based splice logic:
+        For each adjacent slice pair (left, right) with overlap:
+        1. Compute overlap_T = number of overlapping timesteps (proportional to
+           pixel overlap / slice pixel width).
+        2. In left slice's last overlap_T timesteps, get blank prob at each t.
+        3. In right slice's first overlap_T timesteps, get blank prob at each t.
+        4. For each possible cut position k in [0, overlap_T]:
+           score(k) = left_blank[k] + right_blank[k]
+           This finds where BOTH slices agree there's a CTC boundary.
+        5. Pick k with highest score. Keep left[:T-overlap_T+k] + right[k:].
+    """
+    if len(slice_probs_list) == 1:
+        return slice_probs_list[0]
+
+    T = slice_probs_list[0].shape[1]  # timesteps per slice
+    combined = slice_probs_list[0][0].copy()  # [T, C]
+
+    for i in range(1, len(slice_probs_list)):
+        curr = slice_probs_list[i][0]  # [T, C]
+
+        overlap_px = max(0, slice_infos[i - 1]["end_x"] - slice_infos[i]["start_x"])
+        slice_w = slice_infos[i]["end_x"] - slice_infos[i]["start_x"]
+
+        overlap_T = int(round(T * overlap_px / slice_w)) if slice_w > 0 and overlap_px > 0 else 0
+        overlap_T = min(overlap_T, T - 1, len(combined) - 1)
+
+        if overlap_T > 0 and method == 'blank':
+            # blank is index 0 in character list
+            left_overlap = combined[-overlap_T:]      # [overlap_T, C]
+            right_overlap = curr[:overlap_T]           # [overlap_T, C]
+
+            left_blank = left_overlap[:, 0]   # blank prob per timestep
+            right_blank = right_overlap[:, 0]
+
+            # Score each cut position: want both sides to be at a blank boundary
+            scores = left_blank + right_blank
+            best_k = int(np.argmax(scores))
+
+            # Splice: keep left up to cut, keep right from cut
+            combined = np.concatenate([
+                combined[:len(combined) - overlap_T + best_k],
+                curr[best_k:]
+            ], axis=0)
+        elif overlap_T > 0 and method == 'avg':
+            avg = (combined[-overlap_T:] + curr[:overlap_T]) / 2.0
+            combined = np.concatenate([combined[:-overlap_T], avg, curr[overlap_T:]], axis=0)
+        else:
+            combined = np.concatenate([combined, curr], axis=0)
+
+    return combined[np.newaxis, :, :]  # [1, total_T, C]
+
+
+def get_recognition_width(crop_img, imgH, imgW, char_width, use_dynamic_width):
+    if use_dynamic_width:
+        h, w = crop_img.shape[:2]
+        crop_imgW = min(math.ceil(imgH * w / float(h)), imgW)
+        crop_imgW = max(crop_imgW, imgH)
+    else:
+        crop_imgW = imgW
+
+    crop_bml = max(1, int(crop_imgW / char_width))
+    return crop_imgW, crop_bml
+
+
+def recognize_crop(ov_recognizer, crop_img, args, character_list, imgW, batch_max_length,
+                   use_dynamic_width=False, do_adjust_contrast=False):
+    crop_slices = split_long_crop(crop_img, imgW,
+                                  trigger_ratio=args.slice_trigger_ratio,
+                                  overlap_ratio=args.slice_overlap_ratio)
+
+    merge_before = getattr(args, 'merge_before_decode', False) and len(crop_slices) > 1
+
+    if merge_before:
+        # Merge-before-decode: stitch probability matrices, then decode once
+        slice_probs = []
+        slice_infos = []
+        total_time = 0.0
+
+        for slice_info in crop_slices:
+            slice_img = slice_info["image"]
+            slice_imgW, slice_bml = get_recognition_width(slice_img, args.imgH, imgW,
+                                                          args.char_width, use_dynamic_width)
+            img_blob = preprocess_recognition(slice_img, imgH=args.imgH, imgW=slice_imgW,
+                                              do_adjust_contrast=do_adjust_contrast,
+                                              adjust_contrast_target=args.adjust_contrast)
+            text_for_pred = np.zeros((1, slice_bml + 1), dtype=np.int64)
+
+            start_t = time.time()
+            recog_output = ov_recognizer({0: img_blob, 1: text_for_pred})
+            total_time += time.time() - start_t
+
+            preds = recog_output[0]
+            probs = softmax(preds, axis=2)
+            slice_probs.append(probs)
+            slice_infos.append(slice_info)
+
+        merge_method = getattr(args, 'merge_method', 'blank')
+        combined_probs = stitch_slice_probs(slice_probs, slice_infos, imgW, method=merge_method)
+        decoded = decode_predictions(combined_probs, character_list,
+                                     decoder=args.decoder, beamWidth=args.beamWidth,
+                                     apply_softmax=False)
+        text, confidence, char_confidences = decoded[0]
+        return text, confidence, total_time, len(crop_slices)
+
+    # Original path: decode each slice independently, merge text
+    slice_results = []
+    total_time = 0.0
+
+    for slice_info in crop_slices:
+        slice_img = slice_info["image"]
+        slice_imgW, slice_bml = get_recognition_width(slice_img, args.imgH, imgW,
+                                                      args.char_width, use_dynamic_width)
+        img_blob = preprocess_recognition(slice_img, imgH=args.imgH, imgW=slice_imgW,
+                                          do_adjust_contrast=do_adjust_contrast,
+                                          adjust_contrast_target=args.adjust_contrast)
+        text_for_pred = np.zeros((1, slice_bml + 1), dtype=np.int64)
+
+        start_t = time.time()
+        recog_output = ov_recognizer({0: img_blob, 1: text_for_pred})
+        total_time += time.time() - start_t
+
+        preds = recog_output[0]
+        decoded = decode_predictions(preds, character_list,
+                                     decoder=args.decoder, beamWidth=args.beamWidth)
+        text, confidence, char_confidences = decoded[0]
+        slice_results.append({
+            "start_x": slice_info["start_x"],
+            "end_x": slice_info["end_x"],
+            "text": text,
+            "confidence": confidence,
+            "char_confidences": char_confidences,
+        })
+
+    merged_text = merge_slice_texts(slice_results)
+    slice_confidences = [item["confidence"] for item in slice_results if item["text"]]
+    if slice_confidences:
+        merged_confidence = float(sum(slice_confidences) / len(slice_confidences))
+    elif slice_results:
+        merged_confidence = float(sum(item["confidence"] for item in slice_results) / len(slice_results))
+    else:
+        merged_confidence = 0.0
+
+    return merged_text, merged_confidence, total_time, len(crop_slices)
+
+
 def softmax(x, axis=-1):
     e_x = np.exp(x - np.max(x, axis=axis, keepdims=True))
     return e_x / e_x.sum(axis=axis, keepdims=True)
@@ -213,20 +485,21 @@ def custom_mean(x):
 
 
 def decode_predictions(preds, characters, ignore_idx=None, decoder='greedy', beamWidth=5,
-                       separator_list=None, dict_list=None):
+                       separator_list=None, dict_list=None, apply_softmax=True):
     """Decode model output using greedy, beam search, or word beam search.
 
     Args:
-        preds: numpy array of shape [batch, T, num_classes] (raw logits).
+        preds: numpy array of shape [batch, T, num_classes] (raw logits or probabilities).
         characters: list where characters[0] = '[blank]'.
         ignore_idx: list of character indices to ignore (e.g. blank + separators).
         decoder: 'greedy', 'beamsearch', or 'wordbeamsearch'.
         beamWidth: beam width for beam search decoders.
         separator_list: dict mapping lang -> [start_sep, end_sep] for word beam search.
         dict_list: dict or list of words for word beam search.
+        apply_softmax: if False, preds are already softmax probabilities.
 
     Returns:
-        list of (text, confidence) tuples.
+        list of (text, confidence, char_confidences) tuples.
     """
     if ignore_idx is None:
         ignore_idx = [0]
@@ -236,7 +509,7 @@ def decode_predictions(preds, characters, ignore_idx=None, decoder='greedy', bea
         dict_list = []
 
     results = []
-    preds_prob = softmax(preds, axis=2)
+    preds_prob = softmax(preds, axis=2) if apply_softmax else preds
 
     for i in range(preds_prob.shape[0]):
         prob = preds_prob[i]  # [T, num_classes]
@@ -258,6 +531,7 @@ def decode_predictions(preds, characters, ignore_idx=None, decoder='greedy', bea
 
             text = ''.join(chars)
             confidence = float(custom_mean(np.array(char_probs))) if char_probs else 0.0
+            char_confidences = [float(value) for value in char_probs]
 
         elif decoder == 'beamsearch':
             # Beam search handles ignore_idx internally via ctcBeamSearch
@@ -267,6 +541,7 @@ def decode_predictions(preds, characters, ignore_idx=None, decoder='greedy', bea
             max_probs = np.max(prob, axis=1)
             char_probs = max_probs[indices != 0]
             confidence = float(custom_mean(char_probs)) if len(char_probs) > 0 else 0.0
+            char_confidences = [float(confidence)] * len(text)
 
         elif decoder == 'wordbeamsearch':
             argmax = np.argmax(prob, axis=1)
@@ -306,8 +581,9 @@ def decode_predictions(preds, characters, ignore_idx=None, decoder='greedy', bea
             max_probs = np.max(prob, axis=1)
             char_probs = max_probs[indices != 0]
             confidence = float(custom_mean(char_probs)) if len(char_probs) > 0 else 0.0
+            char_confidences = [float(confidence)] * len(text)
 
-        results.append((text, confidence))
+        results.append((text, confidence, char_confidences))
 
     return results
 
@@ -375,7 +651,7 @@ def main():
     log.info("Compiled detector model on %s", det_device)
 
     imgW = args.imgW
-    batch_max_length = int(imgW / args.char_width)
+    batch_max_length = max(1, int(imgW / args.char_width))
 
     use_dynamic_width = args.dynamic_width and rec_device != "NPU"
     if args.dynamic_width and rec_device == "NPU":
@@ -385,6 +661,11 @@ def main():
     else:
         log.info("Recognition input width: %d, batch_max_length: %d (char_width=%d)",
                  imgW, batch_max_length, args.char_width)
+    log.info("Long-crop slicing enabled when width > %.2fx imgW (overlap=%.2f)",
+             args.slice_trigger_ratio, args.slice_overlap_ratio)
+    if args.merge_before_decode:
+        log.info("Merge-before-decode: stitching probability matrices before CTC decoding (method=%s)",
+                 args.merge_method)
 
     # ── Load & compile recognizer model ─────────────────────────────────
     ov_recog_model = core.read_model(recognizer_path)
@@ -431,32 +712,20 @@ def main():
     # ── Run recognition (first pass) ─────────────────────────────────────
     results = []
     total_recog_time = 0.0
+    sliced_region_count = 0
 
     for box, crop_img in image_list:
-        # Compute per-crop width if dynamic mode is enabled
-        if use_dynamic_width:
-            h, w = crop_img.shape[:2]
-            crop_imgW = min(math.ceil(args.imgH * w / float(h)), imgW)
-            crop_imgW = max(crop_imgW, args.imgH)  # at least square
-            crop_bml = int(crop_imgW / args.char_width)
-        else:
-            crop_imgW = imgW
-            crop_bml = batch_max_length
-
-        img_blob = preprocess_recognition(crop_img, imgH=args.imgH, imgW=crop_imgW)
-        text_for_pred = np.zeros((1, crop_bml + 1), dtype=np.int64)
-
-        start_t = time.time()
-        recog_output = ov_recognizer({0: img_blob, 1: text_for_pred})
-        total_recog_time += time.time() - start_t
-
-        preds = recog_output[0]   # [1, T, num_classes]
-        decoded = decode_predictions(preds, character_list,
-                                     decoder=args.decoder, beamWidth=args.beamWidth)
-        text, confidence = decoded[0]
+        text, confidence, recog_time, slice_count = recognize_crop(
+            ov_recognizer, crop_img, args, character_list, imgW, batch_max_length,
+            use_dynamic_width=use_dynamic_width)
+        total_recog_time += recog_time
+        if slice_count > 1:
+            sliced_region_count += 1
         results.append((box, text, confidence))
 
     log.info("Recognition inference time: %.3f s (%d regions)", total_recog_time, len(image_list))
+    if sliced_region_count > 0:
+        log.info("Applied long-crop slicing to %d regions in the first pass", sliced_region_count)
 
     # ── Contrast re-try for low-confidence regions ──────────────────────
     # """
@@ -464,29 +733,16 @@ def main():
     if low_confident_idx:
         log.info("Contrast retry: %d regions below confidence threshold %.2f",
                  len(low_confident_idx), args.contrast_ths)
+        retry_sliced_region_count = 0
         for idx in low_confident_idx:
             box, crop_img = image_list[idx]
-            if use_dynamic_width:
-                h, w = crop_img.shape[:2]
-                crop_imgW = min(math.ceil(args.imgH * w / float(h)), imgW)
-                crop_imgW = max(crop_imgW, args.imgH)
-                crop_bml = int(crop_imgW / args.char_width)
-            else:
-                crop_imgW = imgW
-                crop_bml = batch_max_length
-            img_blob = preprocess_recognition(crop_img, imgH=args.imgH, imgW=crop_imgW,
-                                              do_adjust_contrast=True,
-                                              adjust_contrast_target=args.adjust_contrast)
-            text_for_pred = np.zeros((1, crop_bml + 1), dtype=np.int64)
-
-            start_t = time.time()
-            recog_output = ov_recognizer({0: img_blob, 1: text_for_pred})
-            total_recog_time += time.time() - start_t
-
-            preds = recog_output[0]
-            decoded = decode_predictions(preds, character_list,
-                                         decoder=args.decoder, beamWidth=args.beamWidth)
-            text2, confidence2 = decoded[0]
+            text2, confidence2, recog_time, slice_count = recognize_crop(
+                ov_recognizer, crop_img, args, character_list, imgW, batch_max_length,
+                use_dynamic_width=use_dynamic_width,
+                do_adjust_contrast=True)
+            total_recog_time += recog_time
+            if slice_count > 1:
+                retry_sliced_region_count += 1
 
             # Keep the result with higher confidence
             _, text1, confidence1 = results[idx]
@@ -495,6 +751,8 @@ def main():
                 log.info("  Region %d improved: %.4f -> %.4f", idx, confidence1, confidence2)
 
         log.info("Total recognition time (incl. retry): %.3f s", total_recog_time)
+        if retry_sliced_region_count > 0:
+            log.info("Applied long-crop slicing to %d retry regions", retry_sliced_region_count)
     # """
  
     # ── Filter low-confidence results ────────────────────────────────────
