@@ -109,6 +109,15 @@ def parse_args():
                            '"blank" = splice at highest blank-token boundary (preserves CTC alignment), '
                            '"avg" = average overlapping timesteps. Default is "blank". '
                            'Only used when --merge_before_decode is enabled.')
+    args.add_argument("--no_slice", action="store_true",
+                      help='Optional. Disable long-crop slicing entirely. Each detected crop '
+                           'is fed to the recognizer as a single image, regardless of its width. '
+                           'Also disables --merge_before_decode. Use this to compare baseline '
+                           'recognition quality without any slicing optimization.')
+    args.add_argument("--save_rec_input", action="store_true",
+                      help='Optional. Save the preprocessed image actually fed into the '
+                           'recognition model for each crop (denormalized to uint8 PNG). '
+                           'Files are written to <output_dir>/rec_inputs/.')
 
     return parser.parse_args()
 
@@ -394,13 +403,27 @@ def get_recognition_width(crop_img, imgH, imgW, char_width, use_dynamic_width):
     return crop_imgW, crop_bml
 
 
-def recognize_crop(ov_recognizer, crop_img, args, character_list, imgW, batch_max_length,
-                   use_dynamic_width=False, do_adjust_contrast=False):
-    crop_slices = split_long_crop(crop_img, imgW,
-                                  trigger_ratio=args.slice_trigger_ratio,
-                                  overlap_ratio=args.slice_overlap_ratio)
+def save_rec_input_blob(img_blob, save_dir, region_idx, slice_idx):
+    """Denormalize a recognition model input blob and save it as PNG."""
+    img = img_blob[0, 0]  # [imgH, imgW], float32 in [-1, 1]
+    img_uint8 = np.clip((img + 1.0) / 2.0 * 255.0, 0, 255).astype(np.uint8)
+    fname = save_dir / f"reg{region_idx:03d}_slice{slice_idx}.png"
+    cv2.imwrite(str(fname), img_uint8)
 
-    merge_before = getattr(args, 'merge_before_decode', False) and len(crop_slices) > 1
+
+def recognize_crop(ov_recognizer, crop_img, args, character_list, imgW, batch_max_length,
+                   use_dynamic_width=False, do_adjust_contrast=False,
+                   rec_input_save_dir=None, region_idx=0):
+    if getattr(args, 'no_slice', False):
+        crop_slices = [{'image': crop_img, 'start_x': 0, 'end_x': crop_img.shape[1]}]
+    else:
+        crop_slices = split_long_crop(crop_img, imgW,
+                                      trigger_ratio=args.slice_trigger_ratio,
+                                      overlap_ratio=args.slice_overlap_ratio)
+
+    merge_before = (not getattr(args, 'no_slice', False)
+                    and getattr(args, 'merge_before_decode', False)
+                    and len(crop_slices) > 1)
 
     if merge_before:
         # Merge-before-decode: stitch probability matrices, then decode once
@@ -408,13 +431,15 @@ def recognize_crop(ov_recognizer, crop_img, args, character_list, imgW, batch_ma
         slice_infos = []
         total_time = 0.0
 
-        for slice_info in crop_slices:
+        for si, slice_info in enumerate(crop_slices):
             slice_img = slice_info["image"]
             slice_imgW, slice_bml = get_recognition_width(slice_img, args.imgH, imgW,
                                                           args.char_width, use_dynamic_width)
             img_blob = preprocess_recognition(slice_img, imgH=args.imgH, imgW=slice_imgW,
                                               do_adjust_contrast=do_adjust_contrast,
                                               adjust_contrast_target=args.adjust_contrast)
+            if rec_input_save_dir is not None:
+                save_rec_input_blob(img_blob, rec_input_save_dir, region_idx, si)
             text_for_pred = np.zeros((1, slice_bml + 1), dtype=np.int64)
 
             start_t = time.time()
@@ -438,13 +463,15 @@ def recognize_crop(ov_recognizer, crop_img, args, character_list, imgW, batch_ma
     slice_results = []
     total_time = 0.0
 
-    for slice_info in crop_slices:
+    for si, slice_info in enumerate(crop_slices):
         slice_img = slice_info["image"]
         slice_imgW, slice_bml = get_recognition_width(slice_img, args.imgH, imgW,
                                                       args.char_width, use_dynamic_width)
         img_blob = preprocess_recognition(slice_img, imgH=args.imgH, imgW=slice_imgW,
                                           do_adjust_contrast=do_adjust_contrast,
                                           adjust_contrast_target=args.adjust_contrast)
+        if rec_input_save_dir is not None:
+            save_rec_input_blob(img_blob, rec_input_save_dir, region_idx, si)
         text_for_pred = np.zeros((1, slice_bml + 1), dtype=np.int64)
 
         start_t = time.time()
@@ -661,11 +688,14 @@ def main():
     else:
         log.info("Recognition input width: %d, batch_max_length: %d (char_width=%d)",
                  imgW, batch_max_length, args.char_width)
-    log.info("Long-crop slicing enabled when width > %.2fx imgW (overlap=%.2f)",
-             args.slice_trigger_ratio, args.slice_overlap_ratio)
-    if args.merge_before_decode:
-        log.info("Merge-before-decode: stitching probability matrices before CTC decoding (method=%s)",
-                 args.merge_method)
+    if args.no_slice:
+        log.info("Long-crop slicing DISABLED (--no_slice); each crop fed whole to recognizer")
+    else:
+        log.info("Long-crop slicing enabled when width > %.2fx imgW (overlap=%.2f)",
+                 args.slice_trigger_ratio, args.slice_overlap_ratio)
+        if args.merge_before_decode:
+            log.info("Merge-before-decode: stitching probability matrices before CTC decoding (method=%s)",
+                     args.merge_method)
 
     # ── Load & compile recognizer model ─────────────────────────────────
     ov_recog_model = core.read_model(recognizer_path)
@@ -710,14 +740,21 @@ def main():
         log.info("Cropped %d text regions for recognition.", len(image_list))
 
     # ── Run recognition (first pass) ─────────────────────────────────────
+    rec_input_save_dir = None
+    if getattr(args, 'save_rec_input', False):
+        rec_input_save_dir = output_dir / "rec_inputs"
+        rec_input_save_dir.mkdir(parents=True, exist_ok=True)
+        log.info("Recognition model inputs will be saved to %s", rec_input_save_dir)
+
     results = []
     total_recog_time = 0.0
     sliced_region_count = 0
 
-    for box, crop_img in image_list:
+    for region_idx, (box, crop_img) in enumerate(image_list):
         text, confidence, recog_time, slice_count = recognize_crop(
             ov_recognizer, crop_img, args, character_list, imgW, batch_max_length,
-            use_dynamic_width=use_dynamic_width)
+            use_dynamic_width=use_dynamic_width,
+            rec_input_save_dir=rec_input_save_dir, region_idx=region_idx)
         total_recog_time += recog_time
         if slice_count > 1:
             sliced_region_count += 1
@@ -739,7 +776,8 @@ def main():
             text2, confidence2, recog_time, slice_count = recognize_crop(
                 ov_recognizer, crop_img, args, character_list, imgW, batch_max_length,
                 use_dynamic_width=use_dynamic_width,
-                do_adjust_contrast=True)
+                do_adjust_contrast=True,
+                rec_input_save_dir=rec_input_save_dir, region_idx=idx)
             total_recog_time += recog_time
             if slice_count > 1:
                 retry_sliced_region_count += 1
